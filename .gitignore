@@ -1,0 +1,27 @@
+# 环境
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# 本项目运行时缓存（模型/翻译包/下载）
+.hf-cache/
+.argos/
+out/
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+
+# 测试
+.coverage
+htmlcov/
+.pytest_cache/
+
+tmp*/

@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicetwin"
+version = "0.0.1"
+description = "把「翻译话」换成「翻译人」：同声传译时保留原说话人的音色、时间轴与来源声明。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "VoiceTwin Authors" }]
+keywords = ["speech-translation", "voice-cloning", "asr", "tts", "simultaneous-interpretation", "dubbing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+  "Topic :: Text Processing :: Linguistic",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/your-name/voicetwin"
+Documentation = "https://github.com/your-name/voicetwin/blob/main/docs/ARCHITECTURE.md"
+Issues = "https://github.com/your-name/voicetwin/issues"
+
+[project.optional-dependencies]
+real = [
+  "faster-whisper>=1.2",
+  # faster-whisper 1.2.1 调用 av.open(..., metadata_errors=...)，PyAV 19 移除了该参数，会直接 TypeError。
+  "av>=14,<15",
+  "silero-vad>=5.0",
+  "pyannote.audio>=3.1",
+  "httpx>=0.27",
+]
+# 完全离线的机器翻译（无 API key 也能出中文，质量弱于 LLM）
+argos = ["argostranslate>=1.9"]
+dev = ["coverage>=7.0"]
+
+[project.scripts]
+voicetwin = "voicetwin.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["voicetwin*"]
+
+[tool.setuptools.package-data]
+voicetwin = ["py.typed"]
