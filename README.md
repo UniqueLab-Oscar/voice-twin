@@ -52,6 +52,10 @@ python -m voicetwin serve --port 8765
 # 3) 命令行真实链路（需要 .venv312，见下）
 .venv312\Scripts\python -m voicetwin run --no-mock --audio demo/en_speech.wav \
     --translator argos --asr-model tiny.en --tts sapi --out out/real
+
+# 4) 分块同传：按 3 秒切块，边切边译，量的是「延迟」不是「总耗时」
+.venv312\Scripts\python -m voicetwin stream --audio demo/en_speech.wav --window 3.0 \
+    --asr-model tiny.en --translator passthrough --out out/stream
 ```
 
 `serve` 只监听 `127.0.0.1`：上传音频 → 跑完整链路 → 页面展示每阶段耗时、逐句译文、可播放配音、SRT 下载。
@@ -66,10 +70,36 @@ python -m voicetwin serve --port 8765
 | 克隆 TTS 契约 | `--tts http --tts-url http://127.0.0.1:9880/synthesize` | 每句落盘 `001.wav` / `002.wav`，参考音频自动截取 `reference.wav` |
 | 时间轴对齐 | `fit_to_timeline` 对 3 s 音频对齐到 1 s | 产物严格 1.00 s，超出部分 1.3× 加速后淡出截断 |
 | 溯源块 | `stamp` 后 `read_stamp` | 引擎 / consent / 参考音频 sha256 全部读回，audio data 字节不变 |
-| 测试 | `.venv312\Scripts\python -m unittest discover -s tests` | **27 passed** |
+| 分块同传 | `stream --window 3.0 --asr-model tiny.en` | 3 块、每块 **约 460 ms** 出结果，RTF **0.20**，首块 465 ms，两句话完整无截断 |
+| 测试 | `.venv312\Scripts\python -m unittest discover -s tests` | **33 passed** |
 
 > 表中的 `argos` 是本机无 LLM 时的兜底：**质量明显弱于 LLM**，只证明链路真能出中文。
 > 想要译员级质量，用 Ollama 或 OpenAI 兼容 API。
+
+## 分块同传：把「说完多久出中文」量出来
+
+整段跑完的总耗时对同传没有意义。`stream` 子命令按固定窗口切块、逐块识别+翻译，
+每块都打印延迟与进度（落后=处理慢于音频，领先=快于音频）：
+
+```
+输入：demo/en_speech.wav  块数：3  窗口：3.0s
+[   0.0s →    3.0s] 延迟    474 ms    领先 2526 ms  Real-time translation has always been about words.
+[   3.0s →    6.0s] 延迟    443 ms    领先 5083 ms  But what if we translated the person instead?
+[   6.0s →    6.8s] 延迟    450 ms    领先 5481 ms  （无语音）
+
+RTF 0.20（可实时）  首块延迟 474 ms  全程领先 5481 ms
+```
+
+三条设计取舍（都写进了代码）：
+
+- **模型只加载一次**：`Asr` 内部缓存 `WhisperModel`；首次加载走 `warmup()` 空跑静音，不计入延迟。
+- **跨块接上下文**：上一块识别文本的尾部作为 `initial_prompt` 喂给下一块，句子不会在块边界被切碎。
+- **静音不脑补**：`no_speech_prob > 0.6` 的块直接丢弃，否则静音尾巴会被写成 "Thank you."。
+
+产物：`stream.md`（延迟表）、`stream.srt`（可直接挂播放器）。
+
+> RTF < 1 只说明「追得上音频」，不等于端到端 1.5 s：3 s 块 + 0.47 s 处理 ≈ 3.5 s 端到端。
+> 要压到 1.5 s 以内需要流式 ASR（边出边改）+ 更小的块，见 `docs/ARCHITECTURE.md` §14。
 
 ## 接真模型
 

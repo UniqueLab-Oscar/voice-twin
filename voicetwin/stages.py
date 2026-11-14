@@ -10,6 +10,8 @@ import json
 import math
 import os
 import subprocess
+import tempfile
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -205,8 +207,12 @@ class Vad:
 class Asr:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        # 分块同传会反复调用 transcribe；模型只在第一次加载，避免每块都重新载入
+        self._model = None
 
-    def transcribe(self, source: str) -> list[Segment]:
+    def transcribe(self, source: str, prompt: str = "") -> list[Segment]:
+        """`prompt` 是上一块已识别的尾部文本，用来让模型接上下文，少切句子。"""
+
         if self.cfg.mock or source.lower().endswith((".tsv", ".txt")):
             return load_transcript(source)
         # 国内网络直连 huggingface.co 基本不通；默认走镜像，用户可用环境变量覆盖。
@@ -214,9 +220,41 @@ class Asr:
         os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / ".hf-cache"))
         from faster_whisper import WhisperModel
 
-        model = WhisperModel(self.cfg.asr_model, device=self.cfg.asr_device, compute_type="int8")
-        segs, _info = model.transcribe(source, language=self.cfg.src_lang, vad_filter=True)
-        return [Segment(float(s.start), float(s.end), s.text.strip()) for s in segs]
+        if self._model is None:
+            self._model = WhisperModel(self.cfg.asr_model, device=self.cfg.asr_device, compute_type="int8")
+        segs, _info = self._model.transcribe(
+            source,
+            language=self.cfg.src_lang,
+            vad_filter=True,
+            initial_prompt=prompt or None,
+        )
+        out: list[Segment] = []
+        for s in segs:
+            text = s.text.strip()
+            # 静音块常被模型脑补成「Thank you.」之类；no_speech_prob 高的直接丢掉
+            if not text or float(getattr(s, "no_speech_prob", 0.0)) > 0.6:
+                continue
+            out.append(Segment(float(s.start), float(s.end), text))
+        return out
+
+    def warmup(self) -> float:
+        """加载模型并空跑 0.3s 静音，把首次加载成本挡在延迟统计之外。
+
+        返回预热耗时（毫秒）；mock 模式下直接返回 0。
+        """
+
+        if self.cfg.mock:
+            return 0.0
+        t0 = time.perf_counter()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "silence.wav"
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(b"\x00\x00" * 4800)
+            self.transcribe(str(path))
+        return (time.perf_counter() - t0) * 1000
 
 
 # --------------------------------------------------------------------------

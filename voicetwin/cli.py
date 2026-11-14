@@ -129,6 +129,66 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stream(args: argparse.Namespace) -> int:
+    """分块同传：不看总耗时，只看「说完多久能出中文」。"""
+
+    from .stages import Asr, Interpreter
+    from .stream import StreamRunner, render_srt, render_stream, split_wav
+
+    if not args.audio:
+        print("stream 需要 --audio（分块要按时间轴切）", file=sys.stderr)
+        return 2
+
+    cfg = Config(
+        out_dir=args.out,
+        mock=False,
+        llm_model=args.model,
+        style=args.style,
+        glossary=args.glossary,
+        translator=args.translator,
+        asr_model=args.asr_model,
+        asr_device=args.asr_device,
+        tts_engine="none",
+        api_base=args.api_base,
+        api_key=args.api_key,
+    )
+    out = Path(cfg.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    chunks = split_wav(args.audio, out, args.window)
+    if not chunks:
+        print("切块结果为空，检查音频文件", file=sys.stderr)
+        return 2
+
+    asr = Asr(cfg)
+    interpreter = Interpreter(cfg)
+
+    def on_event(ev) -> None:
+        text = " / ".join(t.text for t in ev.translations) or "（无语音）"
+        lag = ev.lag_ms
+        pace = f"落后 {lag:.0f} ms" if lag >= 0 else f"领先 {-lag:.0f} ms"
+        print(
+            f"[{ev.chunk.start:6.1f}s → {ev.chunk.end:6.1f}s] 延迟 {ev.latency_ms:6.0f} ms  {pace:>12}  {text}",
+            flush=True,
+        )
+
+    if not cfg.mock:
+        warm = asr.warmup()
+        print(f"[info] 模型预热 {warm:.0f} ms（不计入延迟统计）")
+    print(f"输入：{args.audio}  块数：{len(chunks)}  窗口：{args.window:.1f}s")
+    report = StreamRunner(asr.transcribe, interpreter.translate, on_event=on_event).run(chunks)
+
+    (out / "stream.md").write_text(render_stream(report, args.window), encoding="utf-8")
+    (out / "stream.srt").write_text(render_srt(report), encoding="utf-8")
+    verdict = "可实时" if report.rtf < 1 else "跟不上"
+    if report.max_lag_ms > 0:
+        pace = f"最大落后 {report.max_lag_ms:.0f} ms"
+    else:
+        pace = f"全程领先 {abs(report.max_lag_ms):.0f} ms"
+    print(f"\nRTF {report.rtf:.2f}（{verdict}）  首块延迟 {report.first_result_ms:.0f} ms  {pace}")
+    print(f"报告：{out / 'stream.md'}   字幕：{out / 'stream.srt'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="voicetwin", description="保留说话人音色的同声传译")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -167,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
     cmp = sub.add_parser("compare", parents=[common], help="直译 vs 译员式重述对比")
     cmp.add_argument("--transcript", required=True)
     cmp.set_defaults(func=cmd_compare)
+
+    stm = sub.add_parser("stream", parents=[common], help="分块同传：边切边译，量化延迟")
+    stm.add_argument("--audio", required=True, help="要模拟同传的音频文件（wav）")
+    stm.add_argument("--window", type=float, default=3.0, help="分块窗口秒数（默认 3.0）")
+    stm.set_defaults(func=cmd_stream)
 
     doc = sub.add_parser("doctor", help="检查本机环境（Python/ffmpeg/Ollama/GPU）")
     doc.set_defaults(func=cmd_doctor)
