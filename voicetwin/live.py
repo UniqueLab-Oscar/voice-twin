@@ -55,6 +55,8 @@ class LiveSession:
         rate: int = 16000,
         tracker: SpeakerTracker | None = None,
     ) -> None:
+        # 实时就是要真模型；mock 只对 transcript 有意义
+        cfg.mock = False
         self.cfg = cfg
         self.on_caption = on_caption
         self.window = window

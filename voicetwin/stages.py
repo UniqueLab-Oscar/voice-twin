@@ -213,8 +213,10 @@ class Asr:
     def transcribe(self, source: str, prompt: str = "") -> list[Segment]:
         """`prompt` 是上一块已识别的尾部文本，用来让模型接上下文，少切句子。"""
 
-        if self.cfg.mock or source.lower().endswith((".tsv", ".txt")):
+        if source.lower().endswith((".tsv", ".txt")):
             return load_transcript(source)
+        if self.cfg.mock:
+            raise RuntimeError("mock 模式只能读 transcript；识别真实音频请设 mock=False")
         # 国内网络直连 huggingface.co 基本不通；默认走镜像，用户可用环境变量覆盖。
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / ".hf-cache"))
