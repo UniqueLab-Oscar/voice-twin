@@ -113,6 +113,23 @@ class LiveSession:
         self._partial_at = 0.0  # 上次草稿的时间点（秒）
         self._pending_draft = ""
 
+        # ---- 流式识别（sherpa-onnx），比 whisper 快一个数量级 ----
+        self.stasr = None
+        self._st_partial = ""
+        self._seg_t0 = 0.0
+        if getattr(cfg, "asr_engine", "whisper") == "stream":
+            try:
+                from .asr_stream import StreamAsr
+
+                model_dir = getattr(cfg, "stream_model", "") or str(
+                    Path(__file__).resolve().parent.parent / "models" / "st-zh-en"
+                )
+                self.stasr = StreamAsr(model_dir)
+                print("[info] 使用 sherpa-onnx 流式识别", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] 流式识别不可用，退回 whisper：{exc}", file=sys.stderr)
+                self.stasr = None
+
         # ---- 多语种配音与播放（默认开）----
         self.player = None
         self.edge_tts = None
@@ -273,6 +290,8 @@ class LiveSession:
     def feed(self, pcm: bytes) -> list[Caption]:
         """喂一段 PCM，返回本次产生的正式字幕（草稿走 on_partial 回调）。"""
 
+        if self.stasr is not None:
+            return self._feed_stream(pcm)
         if self.vad_mode:
             return self._feed_vad(pcm)
 
@@ -296,6 +315,75 @@ class LiveSession:
                 break
         self._since += len(pcm) / (2 * self.rate)
         return out
+
+    def _feed_stream(self, pcm: bytes) -> list[Caption]:
+        """流式模式：每 100ms 喂一次，边说边出草稿，端点定稿。"""
+        assert self.stasr is not None
+        step = len(pcm) / (2 * self.rate)
+        was_quiet = not self._st_partial
+        if was_quiet:
+            self._seg_t0 = max(0.0, self._consumed - 1.0)
+        self._consumed += step
+        self.stasr.accept(pcm)
+        text, endpoint = self.stasr.step()
+
+        out: list[Caption] = []
+        if endpoint and text:
+            out.append(self._emit_stream(text))
+            self.stasr.reset()
+            self._st_partial = ""
+        elif text and text != self._st_partial:
+            self._st_partial = text
+            if self.on_partial and self._consumed - self._partial_at >= 0.12:
+                self._partial_at = self._consumed
+                try:
+                    self.on_partial(text, self._detect_lang(text))
+                except Exception:  # noqa: BLE001
+                    pass
+        return out
+
+    @staticmethod
+    def _detect_lang(text: str) -> str:
+        return "zh" if any("\u4e00" <= ch <= "\u9fff" for ch in text) else "en"
+
+    def _emit_stream(self, text: str) -> Caption:
+        """把一段流式定稿文本走完整链路：翻译 → 配音 → 字幕。"""
+        from .types import Segment, Translated
+
+        t0 = self._seg_t0
+        t1 = self._consumed
+        lang = self._detect_lang(text)
+        if self.cfg.auto_lang:
+            self.cfg.src_lang = lang
+            self.cfg.tgt_lang = "en" if lang == "zh" else "zh"
+
+        asr_ms = 0.0
+        started = time.time()
+        seg = Segment(start=t0, end=t1, text=text, speaker="S0")
+        translated = self.interpreter.translate([seg])
+        text_dst = translated[0].text if translated else ""
+        total_ms = (time.time() - started) * 1000
+
+        audio_path = ""
+
+        cap = Caption(
+            index=len(self.captions),
+            t0=t0,
+            t1=t1,
+            speaker="S0",
+            source=text,
+            translated=text_dst,
+            audio=audio_path,
+            lang=lang,
+            asr_ms=asr_ms,
+            total_ms=total_ms,
+        )
+        self.captions.append(cap)
+        if self.player is not None and text_dst.strip():
+            self._speak(text_dst)
+        if self.on_caption:
+            self.on_caption(cap)
+        return cap
 
     def _draft(self, pcm: bytes) -> str:
         path = self._tmp / "draft.wav"
@@ -332,6 +420,13 @@ class LiveSession:
 
     def flush(self) -> Caption | None:
         """把剩余音频处理掉（说完最后一句时用）。"""
+
+        if self.stasr is not None:
+            text = self.stasr.finish()
+            if not text:
+                return None
+            self._st_partial = ""
+            return self._emit_stream(text)
 
         if self.vad_mode and self.segmenter is not None:
             span = self.segmenter.flush()

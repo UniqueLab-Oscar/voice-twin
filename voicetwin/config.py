@@ -45,6 +45,8 @@ class Config:
     volume: float = 1.0
     interrupt: bool = True      # 新句到来时打断上一句
     quality: str = "fast"       # fast（3B/1 句上下文） | best（7B/2 句上下文）
+    asr_engine: str = "whisper"  # whisper（分段识别） | stream（sherpa 流式）
+    stream_model: str = ""       # 流式模型目录，留空用 models/st-zh-en
 
     # 时间轴与溯源（VoiceTwin 自有能力）
     fit_timing: bool = True  # 合成音频对齐到原句时长（见 timing.py）

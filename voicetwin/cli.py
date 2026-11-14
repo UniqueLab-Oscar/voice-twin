@@ -220,6 +220,8 @@ def cmd_live(args: argparse.Namespace) -> int:
         volume=getattr(args, "volume", 1.0),
         tts_voice=getattr(args, "voice", ""),
         tts_provider=getattr(args, "tts_provider", "edge"),
+        asr_engine=getattr(args, "asr_engine", "whisper"),
+        stream_model=getattr(args, "stream_model", ""),
     )
 
     def show(cap) -> None:
@@ -335,6 +337,13 @@ def main(argv: list[str] | None = None) -> int:
     liv.add_argument("--voice", default="", help="edge-tts 音色名，如 zh-CN-XiaoxiaoNeural")
     liv.add_argument("--tts-provider", choices=["edge", "http", "sapi"], default="edge", help="配音引擎")
     liv.add_argument("--volume", type=float, default=1.0, help="播放音量 0–2")
+    liv.add_argument(
+        "--asr-engine",
+        choices=["whisper", "stream"],
+        default="whisper",
+        help="stream=sherpa-onnx 流式识别（快，边说边出字）",
+    )
+    liv.add_argument("--stream-model", default="", help="流式模型目录，默认 models/st-zh-en")
     liv.set_defaults(func=cmd_live)
 
     app = sub.add_parser("app", parents=[common], help="打开图形界面（实时字幕 + 换声 + 说话人）")
