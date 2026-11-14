@@ -251,3 +251,51 @@ RTF 0.20
 ### 14.6 测试
 `tests/test_stream.py` 6 个用例覆盖：均分切块、短尾巴合并、非法窗口、块内时间偏移、
 空块无译文、SRT/报告渲染。全程不加载模型。
+
+## 15. 实时应用（live / app / speakers）
+
+### 15.1 数据流
+
+```
+麦克风 16k/16bit/mono ──(sounddevice RawInputStream, blocksize=1600)──▶ queue
+   └─▶ LiveSession.feed(pcm)  攒满 window 秒
+         ├─ 写临时 wav
+         ├─ SpeakerTracker.assign(pcm)  → S0/S1/...
+         ├─ Asr.transcribe(wav, prompt=上一块尾部文本)
+         ├─ Interpreter.translate(segments)
+         └─ 可选 VoiceTts.synthesize（说话人首块音频作为参考）
+   └─▶ Caption → 回调（命令行打印 / tkinter 队列）
+```
+
+采集在子线程，界面用 `queue.Queue` + `root.after(120)` 回主线程刷新，
+不在 Tk 线程里碰音频或模型。
+
+### 15.2 说话人自动区分
+
+- 特征：每块 16k PCM 的中位基频 F0（自相关，70–400 Hz，归一化峰值 <0.25 视为无周期）。
+- 判定：与已有说话人档案差 ≤20% 视为同一人；新声音需连续 `confirm_hits=2` 块才建档。
+- 静音/低能量块（RMS < 0.01）沿用上一位说话人，不让字幕标签乱跳。
+- 上限 8 人，超出则归到音高最近的一位。
+- 每个说话人的**第一块音频**留作参考（`reference(name)`），换声时直接用它做 zero-shot 参考。
+
+为什么不用 pyannote：它需要整段音频做聚类，实时场景只能拿到几秒窗口，且要 GPU 与 HF 授权。
+
+### 15.3 跨块接词
+
+固定窗口必然在词中间切开。ASR 的 `initial_prompt` 能补上下文，但输出仍可能以 `-` 结尾。
+处理：文本以 `-` 结尾时不发字幕，把文本与起始时间压进 `_carry_src/_carry_dst/_carry_t0`，
+下一块拼接后再发，时间轴仍然从原起点算起。
+
+### 15.4 实测
+
+| 场景 | 结果 |
+| --- | --- |
+| `live --file demo/en_speech.wav --fast --window 2.5` | 1 条字幕（两句合并），`S0 ≈ 187 Hz` |
+| `live --file` 1.5 s 窗口 | 文本被切碎（`has always been about words.`），故默认 2.5 s |
+| 麦克风设备枚举 | `[0] Microsoft 声音映射器`、`[1] 麦克风阵列 (Intel 智音)`、`[16] 立体声混音`、`[17] 麦克风 (Realtek)` |
+
+### 15.5 局限与下一步
+
+- 音高接近的同性别说话人会合并 → 下一步换 ECAPA 声纹向量（speechbrain，CPU 可跑，需下模型）。
+- 换声仍是 HTTP 契约 + 参考桩；真引擎（CosyVoice2/GPT-SoVITS）需要 GPU。
+- 端到端延迟 = 窗口 + 处理 ≈ 2.5 + 0.5 s；要压到 1.5 s 内需要流式 ASR（边出边改）。

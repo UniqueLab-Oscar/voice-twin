@@ -101,6 +101,41 @@ RTF 0.20（可实时）  首块延迟 474 ms  全程领先 5481 ms
 > RTF < 1 只说明「追得上音频」，不等于端到端 1.5 s：3 s 块 + 0.47 s 处理 ≈ 3.5 s 端到端。
 > 要压到 1.5 s 以内需要流式 ASR（边出边改）+ 更小的块，见 `docs/ARCHITECTURE.md` §14。
 
+## 实时应用：一个窗口，边说边出字
+
+`stream` 是回放文件，`live` / `app` 才是实时：麦克风边采边切，每块立刻出字幕，
+并自动给每句标上说话人（音高聚类，同一个人不会因为一句话音调变了就换人）。
+
+![应用窗口](docs/img/app-window.png)
+
+```bash
+# 图形应用（推荐）：开始/停止、换声开关、设备选择
+.venv312\Scripts\python -m voicetwin app --asr-model tiny.en --translator passthrough
+
+# 纯命令行版（无 GUI，适合远程/无桌面）
+.venv312\Scripts\python -m voicetwin live --asr-model tiny.en --translator passthrough
+
+# 没有麦克风时用文件模拟（--fast 不按真实时间等待）
+.venv312\Scripts\python -m voicetwin live --file demo/en_speech.wav --fast --no-voice
+```
+
+实测（tiny.en / passthrough / 无换声，2.5 s 窗口）：
+
+```
+[00:02] S0  Real-time translation has always been about words. But what if we translate the person instead?
+          → Real-time translation has always been about words. But what if we translate the person instead?
+共 1 句 · 说话人：S0 ≈ 187 Hz
+```
+
+三个实现要点：
+
+- **跨块接词**：某块文本以 `-` 结尾说明单词被窗口切断了，先压住不出字幕，等下一块接上再一起出。
+- **在线说话人**：每块算中位基频（自相关），与已有档案差 ≤20% 判同一人；新声音要连续两块才建档，避免噪声乱开人。
+- **换声失败不刷屏**：没有克隆引擎时只警告一次，之后安静地只出字幕。
+
+局限（写在 `docs/ARCHITECTURE.md` §15）：音高接近的两个同性别说话人会合并；正式版应换
+ECAPA/pyannote 声纹向量。换声要真接上 CosyVoice2 或 GPT-SoVITS 的 HTTP 服务，CPU 上跑不动。
+
 ## 接真模型
 
 > 系统 Python 是 3.15，ML 轮子还没覆盖（`ctranslate2` 无 cp315 wheel）；用 **3.12** 建 venv。

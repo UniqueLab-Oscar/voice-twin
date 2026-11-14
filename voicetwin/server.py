@@ -185,7 +185,7 @@ $('#go').onclick = async () => {
 function render(j) {
   $('#timing').style.display = 'block';
   $('#chips').innerHTML = Object.entries(j.timings).map(([k,v]) =>
-    `<span class="chip">${k} <b>${v < 0 ? '失败' : v.toFixed(0) + ' ms'}</b></span>`).join('');
+    `<span class="chip">${k} <b>${v < 0 ? (k.indexOf('skip') >= 0 ? '未启用' : '失败') : v.toFixed(0) + ' ms'}</b></span>`).join('');
   $('#result').style.display = 'block';
   $('#rows').innerHTML = j.rows.map(r => `<tr>
     <td>${r.i}</td><td>${r.start.toFixed(2)}s</td><td>${r.speaker}</td>

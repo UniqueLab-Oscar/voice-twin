@@ -189,6 +189,71 @@ def cmd_stream(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_live(args: argparse.Namespace) -> int:
+    """实时字幕同传：麦克风直采（或用 --file 回放模拟）。"""
+
+    from .live import LiveSession, replay_wav, run_mic
+
+    cfg = Config(
+        out_dir=args.out,
+        mock=False,
+        llm_model=args.model,
+        style=args.style,
+        glossary=args.glossary,
+        translator=args.translator,
+        asr_model=args.asr_model,
+        asr_device=args.asr_device,
+        tts_engine=args.tts if not args.no_voice else "none",
+        tts_url=args.tts_url,
+        tts_cmd=getattr(args, "tts_cmd", ""),
+        api_base=args.api_base,
+        api_key=args.api_key,
+    )
+
+    def show(cap) -> None:
+        print(f"[{_fmt_ts(cap.t0)}] {cap.speaker}  {cap.source}")
+        print(f"          → {cap.translated}" + (f"  (♪ {cap.audio})" if cap.audio else ""), flush=True)
+
+    session = LiveSession(cfg, on_caption=show, window=args.window)
+    print(f"引擎：asr={cfg.asr_model} translator={cfg.translator} tts={cfg.tts_engine}")
+    try:
+        if args.file:
+            for pcm in replay_wav(args.file, args.window, realtime=not args.fast):
+                session.feed(pcm)
+            session.flush()
+        else:
+            run_mic(session, device=args.device)
+    except KeyboardInterrupt:
+        print("\n[info] 停止")
+    finally:
+        session.flush()
+        print(f"\n共 {len(session.captions)} 句 · 说话人：{session.tracker.summary()}")
+        session.close()
+    return 0
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    """打开图形应用（tkinter）。"""
+
+    from .app import launch
+
+    cfg = Config(
+        out_dir=args.out,
+        mock=False,
+        llm_model=args.model,
+        style=args.style,
+        translator=args.translator,
+        asr_model=args.asr_model,
+        asr_device=args.asr_device,
+        tts_engine=args.tts,
+        tts_url=args.tts_url,
+        api_base=args.api_base,
+        api_key=args.api_key,
+    )
+    launch(cfg, window=args.window, device=args.device)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="voicetwin", description="保留说话人音色的同声传译")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -227,6 +292,19 @@ def main(argv: list[str] | None = None) -> int:
     cmp = sub.add_parser("compare", parents=[common], help="直译 vs 译员式重述对比")
     cmp.add_argument("--transcript", required=True)
     cmp.set_defaults(func=cmd_compare)
+
+    liv = sub.add_parser("live", parents=[common], help="实时字幕同传（麦克风直采，或 --file 回放）")
+    liv.add_argument("--file", default="", help="用 wav 回放模拟麦克风（16k/16bit/单声道）")
+    liv.add_argument("--fast", action="store_true", help="回放时全速，不按真实时间等待")
+    liv.add_argument("--window", type=float, default=2.5, help="每块窗口秒数（默认 1.5）")
+    liv.add_argument("--device", type=int, default=None, help="录音设备编号，见 --list-devices")
+    liv.add_argument("--no-voice", action="store_true", help="只出字幕，不合成声音")
+    liv.set_defaults(func=cmd_live)
+
+    app = sub.add_parser("app", parents=[common], help="打开图形界面（实时字幕 + 换声 + 说话人）")
+    app.add_argument("--window", type=float, default=2.5, help="每块窗口秒数")
+    app.add_argument("--device", type=int, default=None, help="录音设备编号")
+    app.set_defaults(func=cmd_app)
 
     stm = sub.add_parser("stream", parents=[common], help="分块同传：边切边译，量化延迟")
     stm.add_argument("--audio", required=True, help="要模拟同传的音频文件（wav）")

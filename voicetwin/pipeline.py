@@ -29,6 +29,10 @@ class Pipeline:
         if not self.cfg.mock and audio_path:
             try:
                 report.elapsed_ms["vad"] = self._time(lambda: self.vad.detect(audio_path))
+            except ImportError as exc:
+                # 没装 silero-vad 属于「可选组件缺席」，不是链路故障
+                report.elapsed_ms["vad_skip"] = -1
+                print(f"[info] VAD 未启用（缺依赖）：{exc}")
             except Exception as exc:  # noqa: BLE001
                 report.elapsed_ms["vad_error"] = -1
                 print(f"[warn] VAD 失败，跳过：{exc}")
