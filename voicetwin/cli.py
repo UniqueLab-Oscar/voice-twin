@@ -26,6 +26,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         translator=args.translator,
         asr_model=args.asr_model,
         asr_device=args.asr_device,
+        auto_lang=args.auto_lang,
         tts_engine=args.tts,
         tts_url=args.tts_url,
         tts_cmd=getattr(args, "tts_cmd", ""),
@@ -148,6 +149,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
         translator=args.translator,
         asr_model=args.asr_model,
         asr_device=args.asr_device,
+        auto_lang=args.auto_lang,
         tts_engine="none",
         api_base=args.api_base,
         api_key=args.api_key,
@@ -203,19 +205,36 @@ def cmd_live(args: argparse.Namespace) -> int:
         translator=args.translator,
         asr_model=args.asr_model,
         asr_device=args.asr_device,
+        auto_lang=args.auto_lang,
         tts_engine=args.tts if not args.no_voice else "none",
         tts_url=args.tts_url,
         tts_cmd=getattr(args, "tts_cmd", ""),
         api_base=args.api_base,
         api_key=args.api_key,
+        seg_mode=getattr(args, "seg", "vad"),
+        max_segment=getattr(args, "max_segment", 2.0),
+        min_silence=getattr(args, "min_silence", 0.20),
+        partial=getattr(args, "partial", False),
+        quality=getattr(args, "quality", "fast"),
+        playback=not (getattr(args, "no_voice", False) or getattr(args, "no_play", False)),
+        volume=getattr(args, "volume", 1.0),
+        tts_voice=getattr(args, "voice", ""),
+        tts_provider=getattr(args, "tts_provider", "edge"),
     )
 
     def show(cap) -> None:
         print(f"[{_fmt_ts(cap.t0)}] {cap.speaker}  {cap.source}")
-        print(f"          → {cap.translated}" + (f"  (♪ {cap.audio})" if cap.audio else ""), flush=True)
+        cost = f"  (识别 {cap.asr_ms:.0f}ms"
+        if cap.translated:
+            cost += f" · 译完 {cap.total_ms:.0f}ms"
+        cost += ")"
+        print(f"          → {cap.translated}{cost}" + (f"  (♪ {cap.audio})" if cap.audio else ""), flush=True)
 
-    session = LiveSession(cfg, on_caption=show, window=args.window)
-    print(f"引擎：asr={cfg.asr_model} translator={cfg.translator} tts={cfg.tts_engine}")
+    def partial(text: str, lang: str) -> None:
+        print(f"[···] {text}", flush=True)
+
+    session = LiveSession(cfg, on_caption=show, window=args.window, on_partial=partial)
+    print(f"引擎：asr={cfg.asr_model} translator={cfg.translator} tts={cfg.tts_engine} seg={cfg.seg_mode}")
     try:
         if args.file:
             for pcm in replay_wav(args.file, args.window, realtime=not args.fast):
@@ -245,6 +264,7 @@ def cmd_app(args: argparse.Namespace) -> int:
         translator=args.translator,
         asr_model=args.asr_model,
         asr_device=args.asr_device,
+        auto_lang=args.auto_lang,
         tts_engine=args.tts,
         tts_url=args.tts_url,
         api_base=args.api_base,
@@ -255,6 +275,12 @@ def cmd_app(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 GBK，中文/日文会变成乱码
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
     parser = argparse.ArgumentParser(prog="voicetwin", description="保留说话人音色的同声传译")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -266,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--style", choices=["interpreter", "literal"], default="interpreter")
     common.add_argument("--glossary", default="", help="术语表文件（.json 或 每行 源=译 的 .txt）")
     common.add_argument("--translator", choices=["ollama", "openai", "argos", "passthrough"], default="ollama")
+    common.add_argument("--auto-lang", action="store_true", help="中英自动互译：识别到中文就译英文，反之译中文")
     common.add_argument("--asr-model", default="small", help="faster-whisper 模型：tiny/base/small/medium/large-v3")
     common.add_argument("--asr-device", default="auto", help="auto | cpu | cuda")
     common.add_argument("--tts", default="cosyvoice2", choices=["cosyvoice2", "gpt-sovits", "http", "sapi", "system"],
@@ -299,6 +326,15 @@ def main(argv: list[str] | None = None) -> int:
     liv.add_argument("--window", type=float, default=2.5, help="每块窗口秒数（默认 1.5）")
     liv.add_argument("--device", type=int, default=None, help="录音设备编号，见 --list-devices")
     liv.add_argument("--no-voice", action="store_true", help="只出字幕，不合成声音")
+    liv.add_argument("--seg", choices=["vad", "fixed"], default="vad", help="分段方式：vad=端点检测（快）")
+    liv.add_argument("--max-segment", type=float, default=2.0, help="单句最长秒数，超了强切")
+    liv.add_argument("--min-silence", type=float, default=0.20, help="说完多久算一句结束")
+    liv.add_argument("--partial", action="store_true", help="边说边出草稿（更跟手，费一点 CPU）")
+    liv.add_argument("--quality", choices=["fast", "best"], default="fast", help="翻译档位")
+    liv.add_argument("--no-play", action="store_true", help="只出字幕，不播放译音")
+    liv.add_argument("--voice", default="", help="edge-tts 音色名，如 zh-CN-XiaoxiaoNeural")
+    liv.add_argument("--tts-provider", choices=["edge", "http", "sapi"], default="edge", help="配音引擎")
+    liv.add_argument("--volume", type=float, default=1.0, help="播放音量 0–2")
     liv.set_defaults(func=cmd_live)
 
     app = sub.add_parser("app", parents=[common], help="打开图形界面（实时字幕 + 换声 + 说话人）")

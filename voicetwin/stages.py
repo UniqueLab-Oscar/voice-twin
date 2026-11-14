@@ -209,6 +209,7 @@ class Asr:
         self.cfg = cfg
         # 分块同传会反复调用 transcribe；模型只在第一次加载，避免每块都重新载入
         self._model = None
+        self.last_language = ""
 
     def transcribe(self, source: str, prompt: str = "") -> list[Segment]:
         """`prompt` 是上一块已识别的尾部文本，用来让模型接上下文，少切句子。"""
@@ -226,10 +227,12 @@ class Asr:
             self._model = WhisperModel(self.cfg.asr_model, device=self.cfg.asr_device, compute_type="int8")
         segs, _info = self._model.transcribe(
             source,
-            language=self.cfg.src_lang,
+            language=None if self.cfg.auto_lang else self.cfg.src_lang,
             vad_filter=True,
+            beam_size=1,
             initial_prompt=prompt or None,
         )
+        self.last_language = (getattr(_info, "language", "") or "").lower()
         out: list[Segment] = []
         for s in segs:
             text = s.text.strip()

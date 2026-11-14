@@ -49,6 +49,13 @@ class App:
         )
         self.btn.pack(side="left")
 
+        self.auto = tk.BooleanVar(value=self.cfg.auto_lang)
+        tk.Checkbutton(
+            top, text="中英自动互译", variable=self.auto,
+            bg="#0f172a", fg="#cbd5e1", selectcolor="#1e293b", activebackground="#0f172a",
+            activeforeground="#cbd5e1",
+        ).pack(side="left", padx=8)
+
         self.voice = tk.BooleanVar(value=self.cfg.tts_engine != "none")
         tk.Checkbutton(
             top, text="替换成对方的声音", variable=self.voice, command=self._toggle_voice,
@@ -106,6 +113,7 @@ class App:
             mock=False,
             asr_model=self.cfg.asr_model,
             asr_device=self.cfg.asr_device,
+            auto_lang=self.auto.get(),
             translator=self.cfg.translator,
             style=self.cfg.style,
             tts_engine=self.cfg.tts_engine if self.voice.get() else "none",

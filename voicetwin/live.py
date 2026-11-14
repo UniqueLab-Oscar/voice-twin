@@ -13,14 +13,17 @@ import sys
 import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import Config
+from .seg import RingBuffer, Segmenter, overlap_trim
 from .speakers import SpeakerTracker
 from .stages import Asr, Interpreter, VoiceTts
-from .types import Segment
+from .translate import Translator
+from .types import Segment, Translated
 
 
 @dataclass
@@ -34,6 +37,11 @@ class Caption:
     source: str
     translated: str
     audio: str = ""
+    partial: bool = False
+    lang: str = ""
+    asr_ms: int = 0
+    tts_ms: int = 0
+    total_ms: int = 0
 
 
 def _write_wav(path: Path, pcm: bytes, rate: int = 16000) -> None:
@@ -55,11 +63,13 @@ class LiveSession:
         rate: int = 16000,
         tracker: SpeakerTracker | None = None,
         stride: float | None = None,
+        on_partial: Callable[[str, str], None] | None = None,
     ) -> None:
         # 实时就是要真模型；mock 只对 transcript 有意义
         cfg.mock = False
         self.cfg = cfg
         self.on_caption = on_caption
+        self.on_partial = on_partial
         self.window = window
         # 步长小于窗口 = 重叠切块：每 stride 秒就出一次字，但每次看的是最近 window 秒，
         # 既把延迟压到 stride 量级，又不牺牲识别所需的上下文。
@@ -69,6 +79,7 @@ class LiveSession:
 
         self.asr = Asr(cfg)
         self.interpreter = Interpreter(cfg)
+        self.translator = Translator(cfg)
         self.tts = VoiceTts(cfg)
 
         self._buf = bytearray()
@@ -86,18 +97,54 @@ class LiveSession:
         self._carry_t0 = 0.0
         self._carry_speaker = ""
 
+        # ---- 端点检测模式（默认）：静音不出块，说完 ~200ms 就出字 ----
+        self.vad_mode = (getattr(cfg, "seg_mode", "vad") or "vad") == "vad"
+        self.partial = bool(getattr(cfg, "partial", False))
+        self.segmenter = (
+            Segmenter(
+                min_speech=getattr(cfg, "min_speech", 0.15),
+                max_segment=getattr(cfg, "max_segment", 2.0),
+                min_silence=getattr(cfg, "min_silence", 0.20),
+            )
+            if self.vad_mode
+            else None
+        )
+        self.ring = RingBuffer(seconds=8.0, rate=self.rate) if self.vad_mode else None
+        self._partial_at = 0.0  # 上次草稿的时间点（秒）
+        self._pending_draft = ""
+
+        # ---- 多语种配音与播放（默认开）----
+        self.player = None
+        self.edge_tts = None
+        self._voice_pool: ThreadPoolExecutor | None = None
+        if getattr(cfg, "playback", False) and getattr(cfg, "tts_provider", "edge") == "edge":
+            try:
+                from .playback import Player, has_output_device
+                from .tts_multi import EdgeTts
+
+                if has_output_device() and EdgeTts(cfg.tts_voice if hasattr(cfg, "tts_voice") else "").available():
+                    self.player = Player(volume=getattr(cfg, "volume", 1.0))
+                    self.edge_tts = EdgeTts(getattr(cfg, "tts_voice", ""))
+                    self._voice_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vt-voice")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] 配音不可用，只出字幕：{exc}", file=sys.stderr)
+                self.player = None
+
     # -- 内部 -------------------------------------------------------------
-    def _process(self, pcm: bytes) -> Caption | None:
+    def _process(self, pcm: bytes, start: float | None = None) -> Caption | None:
         chunk = self._tmp / f"{self._index + 1:04d}.wav"
         _write_wav(chunk, pcm, self.rate)
 
         speaker = self.tracker.assign(pcm, self.rate)
+        t_asr = time.perf_counter()
         segments = self.asr.transcribe(str(chunk), self._prompt)
+        asr_ms = int((time.perf_counter() - t_asr) * 1000)
+        self._apply_direction()
         if not segments:
             return None
         self._prompt = (self._prompt + " " + segments[-1].text).strip()[-240:]
 
-        base = self._consumed
+        base = self._consumed if start is None else start
         for seg in segments:
             seg.start += base
             seg.end += base
@@ -108,7 +155,8 @@ class LiveSession:
             return None
 
         text_src = " ".join(s.text for s in segments)
-        text_dst = " ".join(t.text for t in translations)
+        # 译员层：带上下文与缓存，逐句翻（合并后的整段一起送，保证语气连贯）
+        text_dst = self.translator.translate(text_src, self.cfg.src_lang, self.cfg.tgt_lang)
 
         t0 = base
         if self._carry_src and self._carry_speaker == speaker:
@@ -149,6 +197,8 @@ class LiveSession:
             speaker=speaker,
             source=text_src,
             translated=text_dst,
+            lang=self.asr.last_language or "",
+            asr_ms=asr_ms,
         )
 
         if self.cfg.tts_engine != "none" and not self._tts_broken:
@@ -158,7 +208,8 @@ class LiveSession:
                     ref_path = self._tmp / f"ref-{speaker}.wav"
                     _write_wav(ref_path, ref_pcm, self.rate)
                     self.cfg.ref_audio = str(ref_path)
-                syn = self.tts.synthesize(translations[0], self._index)
+                spoken = Translated(segment=segments[-1], text=text_dst, style=self.cfg.style)
+                syn = self.tts.synthesize(spoken, self._index)
                 cap.audio = syn.audio_path
             except Exception as exc:  # noqa: BLE001
                 # 没有可用克隆引擎时只提示一次，之后安静地只出字幕
@@ -166,13 +217,64 @@ class LiveSession:
                 print(f"[warn] 换声不可用，之后只出字幕：{exc}", file=sys.stderr)
 
         self.captions.append(cap)
+        if self.player is not None and text_dst.strip():
+            self._speak(text_dst)
         if self.on_caption:
             self.on_caption(cap)
         return cap
 
+    def _speak(self, text: str) -> None:
+        """后台合成 + 入队播放；不阻塞字幕。"""
+        if self.player is None or self.edge_tts is None or self._voice_pool is None:
+            return
+        self.player.start()
+        lang = self.cfg.tgt_lang or "zh"
+
+        def job() -> None:
+            try:
+                path = self._tmp / f"say-{int(time.time() * 1000)}.wav"
+                self.edge_tts.synthesize(text, lang, path)  # type: ignore[union-attr]
+                from .tts_multi import read_pcm
+
+                self.player.enqueue(  # type: ignore[union-attr]
+                    read_pcm(path), interrupt=getattr(self.cfg, "interrupt", True)
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] 配音失败：{exc}", file=sys.stderr)
+
+        self._voice_pool.submit(job)
+
+    def _apply_direction(self) -> None:
+        """中英自动互译：他说中文就译成英文，说英文就译成中文。
+
+        单段的语言检测会抖（同一段中文偶尔被判成 en），所以要求连续 2 段一致才切换方向，
+        否则一段噪声就能把整个会议的方向翻过来。
+        """
+
+        if not self.cfg.auto_lang:
+            return
+        lang = self.asr.last_language or ""
+        if not lang:
+            return
+        src = "zh" if lang.startswith("zh") else "en"
+        if src == getattr(self, "_lang_vote", ""):
+            self._lang_hits = getattr(self, "_lang_hits", 0) + 1
+        else:
+            self._lang_vote, self._lang_hits = src, 1
+        current = self.cfg.src_lang.split("-")[0].lower()
+        if self._lang_hits < 2 or src == current:
+            return
+        tgt = "en" if src == "zh" else "zh"
+        if (self.cfg.src_lang, self.cfg.tgt_lang) != (src, tgt):
+            self.cfg.src_lang, self.cfg.tgt_lang = src, tgt
+            print(f"[info] 识别到 {lang}，方向 {src} → {tgt}", file=sys.stderr)
+
     # -- 对外 -------------------------------------------------------------
     def feed(self, pcm: bytes) -> list[Caption]:
-        """喂一段 PCM；每攒够一个步长就用最近一个窗口处理，返回产生的字幕。"""
+        """喂一段 PCM，返回本次产生的正式字幕（草稿走 on_partial 回调）。"""
+
+        if self.vad_mode:
+            return self._feed_vad(pcm)
 
         self._buf.extend(pcm)
         win = int(self.window * self.rate) * 2
@@ -195,8 +297,47 @@ class LiveSession:
         self._since += len(pcm) / (2 * self.rate)
         return out
 
+    def _draft(self, pcm: bytes) -> str:
+        path = self._tmp / "draft.wav"
+        _write_wav(path, pcm, self.rate)
+        segments = self.asr.transcribe(str(path), "")
+        return " ".join(s.text for s in segments).strip()
+
+    def _feed_vad(self, pcm: bytes) -> list[Caption]:
+        """端点检测模式：只对「完整的一句话」跑全链路。"""
+        assert self.segmenter is not None and self.ring is not None
+        self.ring.push(pcm)
+        self._consumed += len(pcm) / (2 * self.rate)
+        out: list[Caption] = []
+        for span in self.segmenter.feed(pcm):
+            cap = self._process(span.pcm, start=span.start)
+            if cap:
+                out.append(cap)
+        if self.partial and self.on_partial and self.segmenter.in_speech:
+            if self._consumed - self._partial_at >= 0.35:
+                self._partial_at = self._consumed
+                window = self.segmenter.partial_window(1.2)
+                if len(window) >= int(0.3 * self.rate) * 2:
+                    try:
+                        text = self._draft(window)
+                    except Exception:  # noqa: BLE001
+                        text = ""
+                    if text and text != self._pending_draft:
+                        self._pending_draft = text
+                        try:
+                            self.on_partial(text, self.asr.last_language or "")
+                        except Exception:  # noqa: BLE001
+                            pass
+        return out
+
     def flush(self) -> Caption | None:
-        """把剩余不足一窗的音频也处理掉（说完最后一句时用）。"""
+        """把剩余音频处理掉（说完最后一句时用）。"""
+
+        if self.vad_mode and self.segmenter is not None:
+            span = self.segmenter.flush()
+            if span is None:
+                return None
+            return self._process(span.pcm, start=span.start)
 
         if len(self._buf) < int(0.4 * self.rate) * 2:
             return None
@@ -206,6 +347,15 @@ class LiveSession:
         return self._process(block)
 
     def close(self) -> None:
+        if self._voice_pool is not None:
+            self._voice_pool.shutdown(wait=False, cancel_futures=True)
+            self._voice_pool = None
+        if self.player is not None:
+            try:
+                self.player.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.player = None
         for p in self._tmp.glob("*"):
             try:
                 p.unlink()
