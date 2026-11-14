@@ -13,7 +13,7 @@ from tkinter import ttk
 from typing import Callable
 
 from .config import Config
-from .live import Caption, LiveSession, list_devices, run_mic
+from .live import Caption, LiveSession, captions_to_srt, list_devices, run_mic
 
 SPEAKER_COLORS = ["#5eead4", "#f9a8d4", "#fcd34d", "#93c5fd", "#c4b5fd", "#fca5a5"]
 
@@ -146,10 +146,31 @@ class App:
         self.btn.configure(text="▶ 开始监听", bg="#2563eb")
         self.status.configure(text="已停止", fg="#94a3b8")
         if self.session:
+            saved = self._save_srt()
+            note = f" · 已存 {saved}" if saved else ""
             self.status.configure(
-                text=f"已停止 · 共 {len(self.session.captions)} 句 · {self.session.tracker.summary()}",
+                text=f"已停止 · 共 {len(self.session.captions)} 句 · {self.session.tracker.summary()}{note}",
                 fg="#94a3b8",
             )
+
+    def _save_srt(self) -> str:
+        """停止时把本次字幕落盘，方便复盘或挂播放器。"""
+
+        if not (self.session and self.session.captions):
+            return ""
+        try:
+            from pathlib import Path
+            import time as _time
+
+            out = Path(self.cfg.out_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"live-{_time.strftime('%Y%m%d-%H%M%S')}.srt"
+            path.write_text(captions_to_srt(self.session.captions), encoding="utf-8")
+            self._write(f"\n      💾 字幕已保存：{path}\n", "ts")
+            return str(path)
+        except Exception as exc:  # noqa: BLE001
+            self._write(f"\n      ⚠ 字幕保存失败：{exc}\n", "ts")
+            return ""
 
     def _toggle_voice(self) -> None:
         self.status.configure(text="换声：" + ("开" if self.voice.get() else "关"), fg="#94a3b8")

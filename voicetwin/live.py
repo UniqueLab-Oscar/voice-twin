@@ -54,12 +54,16 @@ class LiveSession:
         window: float = 1.5,
         rate: int = 16000,
         tracker: SpeakerTracker | None = None,
+        stride: float | None = None,
     ) -> None:
         # 实时就是要真模型；mock 只对 transcript 有意义
         cfg.mock = False
         self.cfg = cfg
         self.on_caption = on_caption
         self.window = window
+        # 步长小于窗口 = 重叠切块：每 stride 秒就出一次字，但每次看的是最近 window 秒，
+        # 既把延迟压到 stride 量级，又不牺牲识别所需的上下文。
+        self.stride = stride or window
         self.rate = rate
         self.tracker = tracker or SpeakerTracker()
 
@@ -68,6 +72,8 @@ class LiveSession:
         self.tts = VoiceTts(cfg)
 
         self._buf = bytearray()
+        self._since = 0.0          # 距上次处理又过去了几秒音频
+        self._last_text = ""
         self._prompt = ""
         self._consumed = 0.0
         self._index = 0
@@ -112,6 +118,21 @@ class LiveSession:
         self._carry_src = self._carry_dst = ""
         self._carry_speaker = ""
 
+        # 重叠窗口会重复上一块的内容：把重复的前缀剪掉，只留新说的部分
+        words = text_src.split()
+        prev_words = self._last_text.split()
+        cut = 0
+        for k in range(min(len(words), len(prev_words)), 0, -1):
+            if prev_words[-k:] == words[:k]:
+                cut = k
+                break
+        if cut:
+            text_src = " ".join(words[cut:])
+            text_dst = ""
+        self._last_text = " ".join(words)
+        if not text_src.strip():
+            return None
+
         if text_src.rstrip().endswith("-"):
             # 单词被块边界切断了，压着等下一块，别把半个词推给用户
             self._carry_src = text_src.rstrip().rstrip("-").strip()
@@ -151,18 +172,27 @@ class LiveSession:
 
     # -- 对外 -------------------------------------------------------------
     def feed(self, pcm: bytes) -> list[Caption]:
-        """喂一段 PCM；攒够一个窗口就处理，返回本次产生的字幕。"""
+        """喂一段 PCM；每攒够一个步长就用最近一个窗口处理，返回产生的字幕。"""
 
         self._buf.extend(pcm)
-        need = int(self.window * self.rate) * 2
+        win = int(self.window * self.rate) * 2
+        step = int(self.stride * self.rate) * 2
         out: list[Caption] = []
-        while len(self._buf) >= need:
-            block = bytes(self._buf[:need])
-            del self._buf[:need]
-            self._consumed += need / (2 * self.rate)
+        while len(self._buf) >= max(win, step) and self._since >= self.stride:
+            if self.stride >= self.window:
+                block = bytes(self._buf[:win])
+                self._buf = self._buf[win:]
+            else:
+                block = bytes(self._buf[-win:])
+                self._buf = self._buf[len(self._buf) - win:]
+            self._consumed += step / (2 * self.rate)
+            self._since = 0.0
             cap = self._process(block)
             if cap:
                 out.append(cap)
+            if len(self._buf) < win:
+                break
+        self._since += len(pcm) / (2 * self.rate)
         return out
 
     def flush(self) -> Caption | None:
@@ -244,6 +274,26 @@ def run_mic(session: LiveSession, device: int | None = None, stop: Callable[[], 
                 continue
             session.feed(pcm)
         session.flush()
+
+
+def _srt_ts(seconds: float) -> str:
+    ms = max(0, int(round(seconds * 1000)))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def captions_to_srt(captions: list[Caption]) -> str:
+    """把一次会话的字幕写成 SRT（带上说话人前缀）。"""
+
+    blocks: list[str] = []
+    for i, cap in enumerate(captions, start=1):
+        text = f"{cap.translated}"
+        if cap.speaker:
+            text = f"[{cap.speaker}] {text}"
+        blocks.append(f"{i}\n{_srt_ts(cap.t0)} --> {_srt_ts(cap.t1)}\n{text}\n")
+    return "\n".join(blocks)
 
 
 def list_devices() -> str:
