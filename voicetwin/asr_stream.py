@@ -51,8 +51,8 @@ class StreamAsr:
         num_threads: int = 4,
         provider: str = "cpu",
         decoding: str = "greedy_search",
-        rule1: float = 0.8,
-        rule2: float = 0.5,
+        rule1: float = 0.6,
+        rule2: float = 0.35,
     ) -> None:
         _preload_onnxruntime()
         import sherpa_onnx

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -85,6 +86,8 @@ class Translator:
             history = 2 if getattr(cfg, "quality", "fast") == "best" else 1
         self.history = history
         self.cache = TranslateCache()
+        self._mt = None
+        self._mt_kind = ""
         self.turns: list[Turn] = []
 
     # ---------- 对外 ----------
@@ -106,6 +109,8 @@ class Translator:
             out = text
         elif self.cfg.translator == "argos":
             out = self._argos(text)
+        elif self.cfg.translator in {"marian", "opus", "local"}:
+            out = self._marian(text, src, tgt)
         else:
             out = self._llm(text, src, tgt)
 
@@ -160,6 +165,23 @@ class Translator:
         protected, mapping = self._protect(text)
         raw = self.backend._argos(protected)  # noqa: SLF001
         return self._restore(raw, mapping)
+
+    def _marian(self, text: str, src: str, tgt: str) -> str:
+        from . import mt as mt_mod
+
+        protected, mapping = self._protect(text)
+        where = mt_mod.onnx_dir()
+        if where is not None:
+            from .mt_onnx import translate as onnx_translate
+
+            raw = onnx_translate(where, protected, src, tgt, threads=4)
+            return self._restore(raw, mapping)
+        if self._mt is None:
+            self._mt = mt_mod.MarianMt(threads=min(8, max(2, (os.cpu_count() or 4) // 2)))
+            self._mt_kind = "ct2"
+        if not self._mt.supports(src, tgt):
+            return self._argos(text)
+        return self._restore(self._mt.translate(protected, src, tgt), mapping)
 
     @staticmethod
     def _protect(text: str) -> tuple[str, dict[str, str]]:

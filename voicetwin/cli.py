@@ -130,6 +130,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    from .webapp import serve as serve_ui
+
+    serve_ui(port=args.port, open_browser=args.open_browser)
+    return 0
+
+
 def cmd_stream(args: argparse.Namespace) -> int:
     """分块同传：不看总耗时，只看「说完多久能出中文」。"""
 
@@ -293,7 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--model", default="qwen2.5:7b", help="译员 LLM 模型名")
     common.add_argument("--style", choices=["interpreter", "literal"], default="interpreter")
     common.add_argument("--glossary", default="", help="术语表文件（.json 或 每行 源=译 的 .txt）")
-    common.add_argument("--translator", choices=["ollama", "openai", "argos", "passthrough"], default="ollama")
+    common.add_argument(
+        "--translator",
+        choices=["ollama", "openai", "argos", "marian", "passthrough"],
+        default="ollama",
+    )
     common.add_argument("--auto-lang", action="store_true", help="中英自动互译：识别到中文就译英文，反之译中文")
     common.add_argument("--asr-model", default="small", help="faster-whisper 模型：tiny/base/small/medium/large-v3")
     common.add_argument("--asr-device", default="auto", help="auto | cpu | cuda")
@@ -364,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--out", default="out/web", help="输出目录")
     srv.add_argument("--no-open", dest="open_browser", action="store_false", default=True)
     srv.set_defaults(func=cmd_serve)
+
+    ui = sub.add_parser("ui", help="打开实时同传控制台（深色界面 + 流式识别）")
+    ui.add_argument("--port", type=int, default=8766)
+    ui.add_argument("--no-open", dest="open_browser", action="store_false", default=True)
+    ui.set_defaults(func=cmd_ui)
 
     fa = sub.add_parser("fetch-argos", help="下载 Argos 离线翻译语言包")
     fa.add_argument("--src", default="en")

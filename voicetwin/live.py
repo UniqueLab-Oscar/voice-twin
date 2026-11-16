@@ -89,6 +89,8 @@ class LiveSession:
         self._consumed = 0.0
         self._index = 0
         self.captions: list[Caption] = []
+        self._pending: list = []
+        self._tx_pool = None
         self._tmp = Path(tempfile.mkdtemp(prefix="vt-live-"))
         self._tts_broken = False
         # 上一块以连字符截断时先压着，等下一块接上再出字幕
@@ -120,11 +122,10 @@ class LiveSession:
         if getattr(cfg, "asr_engine", "whisper") == "stream":
             try:
                 from .asr_stream import StreamAsr
+                from .paths import model_dir
 
-                model_dir = getattr(cfg, "stream_model", "") or str(
-                    Path(__file__).resolve().parent.parent / "models" / "st-zh-en"
-                )
-                self.stasr = StreamAsr(model_dir)
+                model_path = getattr(cfg, "stream_model", "") or str(model_dir())
+                self.stasr = StreamAsr(model_path)
                 print("[info] 使用 sherpa-onnx 流式识别", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[warn] 流式识别不可用，退回 whisper：{exc}", file=sys.stderr)
@@ -347,8 +348,11 @@ class LiveSession:
         return "zh" if any("\u4e00" <= ch <= "\u9fff" for ch in text) else "en"
 
     def _emit_stream(self, text: str) -> Caption:
-        """把一段流式定稿文本走完整链路：翻译 → 配音 → 字幕。"""
-        from .types import Segment, Translated
+        """把一段流式定稿文本走完整链路：翻译 → 配音 → 字幕。
+
+        翻译放到线程池里做：opus-mt 单句要几秒，同步做会把麦克风读线程堵死、丢音频。
+        """
+        from .types import Segment
 
         t0 = self._seg_t0
         t1 = self._consumed
@@ -357,33 +361,56 @@ class LiveSession:
             self.cfg.src_lang = lang
             self.cfg.tgt_lang = "en" if lang == "zh" else "zh"
 
-        asr_ms = 0.0
-        started = time.time()
-        seg = Segment(start=t0, end=t1, text=text, speaker="S0")
-        translated = self.interpreter.translate([seg])
-        text_dst = translated[0].text if translated else ""
-        total_ms = (time.time() - started) * 1000
-
-        audio_path = ""
-
         cap = Caption(
             index=len(self.captions),
             t0=t0,
             t1=t1,
             speaker="S0",
             source=text,
-            translated=text_dst,
-            audio=audio_path,
+            translated="",
             lang=lang,
-            asr_ms=asr_ms,
-            total_ms=total_ms,
+            asr_ms=0.0,
+            total_ms=0.0,
         )
         self.captions.append(cap)
+        try:
+            if self._tx_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._tx_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vt-tx")
+            fut = self._tx_pool.submit(self._translate_caption, cap, Segment(start=t0, end=t1, text=text), lang)
+            self._pending.append(fut)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] 翻译线程起不来，退回同步：{exc}")
+            self._translate_caption(cap, Segment(start=t0, end=t1, text=text), lang)
+        return cap
+
+    def _translate_caption(self, cap: Caption, seg, lang: str) -> None:
+        started = time.time()
+        try:
+            text_dst = self.translator.translate(cap.source, self.cfg.src_lang, self.cfg.tgt_lang)
+        except Exception as exc:  # noqa: BLE001
+            import traceback; traceback.print_exc()
+            print(f"[warn] 翻译失败：{exc}")
+            text_dst = ""
+        cap.translated = text_dst
+        cap.total_ms = (time.time() - started) * 1000
         if self.player is not None and text_dst.strip():
             self._speak(text_dst)
         if self.on_caption:
             self.on_caption(cap)
-        return cap
+
+    def drain(self, timeout: float = 30.0) -> None:
+        """等翻译队列跑完（停止/收尾时用）。"""
+        deadline = time.time() + timeout
+        while self._pending:
+            fut = self._pending[0]
+            left = max(0.0, deadline - time.time())
+            try:
+                fut.result(timeout=left)
+            except Exception:  # noqa: BLE001
+                pass
+            self._pending.pop(0)
 
     def _draft(self, pcm: bytes) -> str:
         path = self._tmp / "draft.wav"
@@ -442,6 +469,10 @@ class LiveSession:
         return self._process(block)
 
     def close(self) -> None:
+        self.drain(timeout=120.0)
+        if self._tx_pool is not None:
+            self._tx_pool.shutdown(wait=False, cancel_futures=True)
+            self._tx_pool = None
         if self._voice_pool is not None:
             self._voice_pool.shutdown(wait=False, cancel_futures=True)
             self._voice_pool = None
